@@ -1,4 +1,4 @@
-# Copyright 2016 Fox Wilson
+# Copyright 2016-2022 Tris Emmy Wilson
 # Usage of the works is permitted provided that this instrument is retained
 # with the works, so that any entity that uses the works is notified of this
 # instrument. DISCLAIMER: THE WORKS ARE WITHOUT WARRANTY.
@@ -10,7 +10,6 @@ import functools
 import mido
 import os
 import pickle
-import stuf
 import threading
 import time
 import uuid
@@ -19,7 +18,16 @@ controllers = collections.defaultdict(threading.Event)
 inverse_controllers = collections.defaultdict(threading.Event)
 notes = collections.defaultdict(threading.Event)
 
-state = stuf.stuf({"inp": None, "out": None, "threads": [], "handlers": {}, "tempo": 120, "tsig": 4, "loops": [], "metronome": None})
+class State():
+    def __init__(self):
+        self.inp = self.out = None
+        self.input_pipeline = Pipeline()
+        self.threads = []
+        self.handlers = {}
+        self.tempo = 120
+        self.tsig = 4
+        self.loops = []
+        self.metronome = None
 
 # Utilities
 
@@ -60,15 +68,31 @@ class OpaqueProxy:
         self.value = value
 
 class RecordedMessage(mido.Message):
-    def __init__(self, message):
-        self.__dict__.update(message.__dict__)
+    def __init__(self, **message):
+        self.__dict__.update(message)
+
+    @classmethod
+    def from_message(cls, message):
+        obj = cls()
+        obj.__dict__.update(message.__dict__)
+        return obj
 
     def copy(self, *args, **kwargs):
-        return RecordedMessage(super(RecordedMessage, self).copy(*args, **kwargs))
+        return RecordedMessage.from_message(super(RecordedMessage, self).copy(*args, **kwargs))
 
 def _(x):
     if isinstance(x, OpaqueProxy):
         return x.value
+
+    # handle controller values
+    if isinstance(x, threading.Event):
+        if hasattr(x, "last_value"):
+            return x.last_value / 127
+
+        return 1
+
+    if hasattr(x, "__call__"):
+        return x()
 
     return x
 
@@ -86,6 +110,7 @@ class EventBus:
         for pipeline in self.pipelines:
             if not x:
                 break
+
             result = []
             for i in x:
                 events = pipeline.process(i)
@@ -173,7 +198,7 @@ event.pipelines.append(default_pipeline)
 channel_filter = lambda channel=0: lambda e: e if e.channel == _(channel) else None
 channel_setter = lambda channel=3: lambda e: e.copy(channel=channel)
 transposer = lambda amount: notes_only(lambda e: e.copy(note=e.note + _(amount)))
-velocity_multiplier = lambda factor: lambda e: e if e.type != "note_on" else e.copy(velocity=int(e.velocity * factor))
+velocity_multiplier = lambda factor: lambda e: e if e.type != "note_on" else e.copy(velocity=int(e.velocity * _(factor)))
 
 @notes_only
 def octave(e):
@@ -181,10 +206,16 @@ def octave(e):
 
 transpose = OpaqueProxy(0)
 
+def tempo(*a):
+    if a:
+         state.tempo = a[0]
+
+    return state.tempo
+
 default_pipeline.add(transposer(transpose))
 
 ### misbehaving keyboard support
-default_pipeline.add(lambda e: None if e.channel != 0 and not isinstance(e, RecordedMessage) else e)
+# default_pipeline.add(lambda e: None if e.channel != 0 and not isinstance(e, RecordedMessage) else e)
 
 # MIDI pair context management
 
@@ -200,7 +231,7 @@ def open_pair(input, output):
     state.metronome = Metronome()
 
 def close_pair():
-    for thread in state["threads"]:
+    for thread in state.threads:
         thread.stop_flag.set()
     state.threads.clear()
 
@@ -238,6 +269,7 @@ def state_track(e):
         else:
             controllers[e.control].clear()
             inverse_controllers[e.control].set()
+        controllers[e.control].last_value = e.value
     if e.type == "note_on":
         notes[e.note].set()
         notes[e.note].last_velocity = e.velocity
@@ -245,6 +277,17 @@ def state_track(e):
         notes[e.note].clear()
 
 event.register(state_track)
+
+def bind_to_control(control, func, transform=None):
+    def listener(e):
+        if e.type == "control_change" and e.control == control:
+            value = e.value
+            if transform:
+                value = transform(value)
+
+            func(value)
+
+    event.register(listener)
 
 # Thread management
 
@@ -260,6 +303,7 @@ def setup_threads():
     def send_messages(port, fire, stop):
         while True:
             for msg in state.inp.iter_pending():
+                msg = state.input_pipeline.process(msg)
                 fire(msg)
             if stop.is_set():
                 return
@@ -327,6 +371,8 @@ class Loop:
         self.thread = None
         self.pipeline = Pipeline()
         self.channel = 0
+        self.sync_record_to = None
+        self.sync_on_next = None
         state.metronome.on_measure.append(self.measure)
 
     def __getstate__(self):
@@ -366,18 +412,22 @@ class Loop:
 
             else:
                 self.state += 1
-                if self.state == 2:
+                if self.state >= 2 and (self.sync_record_to is None or self.sync_record_to.is_set()):
                     self.last_ts = time.time()
                     self.really_recording = True
                     threading.Thread(target=self.really_record).start()
 
         elif self.playing:
             self.measures += 1
-            if self.measures % self.length == 0 and (self.measures >= self.length or not self.immediate_play):
+            if self.measures >= 0 and self.measures % self.length == 0 and (self.measures >= self.length or not self.immediate_play):
                 if self.thread is not None:
                     state.threads.remove(self.thread)
                 self.thread = thread_with_stop(target=self.play_once)
                 self.thread.start()
+
+                if self.sync_on_next is not None:
+                    self.sync_on_next.set()
+                    self.sync_on_next = None
 
     def note(self, e):
         if isinstance(e, RecordedMessage):
@@ -390,9 +440,15 @@ class Loop:
         self.notes.append(e.copy(time=beats))
         self.last_ts += seconds
 
-    def record(self):
+    def record(self, sync_to=None):
         state.metronome.audible = True
         self.recording = True
+
+        if sync_to:
+            e = threading.Event()
+            self.sync_record_to = e
+            sync_to.sync_on_next = e
+
         return self
 
     def really_record(self):
@@ -422,6 +478,10 @@ class Loop:
         self.recording = self.really_recording = False
         self.state = 0
         print("Done recording.")
+
+        for note in notes:
+            notes[note].clear()
+
         state.metronome.audible = False
 
         if self.immediate_play:
@@ -435,8 +495,8 @@ class Loop:
         self.playing = True
         return self
 
-    def play(self):
-        self.measures = -1
+    def play(self, measure_delay=0):
+        self.measures = -measure_delay - 1
         self.playing = True
         return self
 
@@ -455,7 +515,7 @@ class Loop:
                 return
             time.sleep((60 / state.tempo) * i.time)
             for e in self.pipeline.process(i):
-                event.fire(RecordedMessage(e.copy(time=0)))
+                event.fire(RecordedMessage.from_message(e.copy(time=0)))
 
     def set_channel(self, channel):
         self.channel = channel
@@ -486,3 +546,7 @@ class ProgramSet:
     def load(name):
         with open(os.path.expanduser("~/.mt2/{}.programset".format(name)), "rb") as f:
             return pickle.load(f)
+
+# Initialize state
+
+state = State()
